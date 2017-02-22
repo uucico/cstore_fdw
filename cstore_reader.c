@@ -33,9 +33,10 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 
+#include "utils/builtins.h"
 
 /* static function declarations */
-static StripeBuffers * LoadFilteredStripeBuffers(FILE *tableFile,
+static StripeBuffers * LoadFilteredStripeBuffers(Relation relation,
 												 StripeMetadata *stripeMetadata,
 												 TupleDesc tupleDescriptor,
 												 List *projectedColumnList,
@@ -44,14 +45,14 @@ static void ReadStripeNextRow(StripeBuffers *stripeBuffers, List *projectedColum
 							  uint64 blockIndex, uint64 blockRowIndex,
 							  ColumnBlockData **blockDataArray,
 							  Datum *columnValues, bool *columnNulls);
-static ColumnBuffers * LoadColumnBuffers(FILE *tableFile,
+static ColumnBuffers * LoadColumnBuffers(Relation relation,
 										 ColumnBlockSkipNode *blockSkipNodeArray,
 										 uint32 blockCount, uint64 existsFileOffset,
 										 uint64 valueFileOffset,
 										 Form_pg_attribute attributeForm);
-static StripeFooter * LoadStripeFooter(FILE *tableFile, StripeMetadata *stripeMetadata,
+static StripeFooter * LoadStripeFooter(Relation relation, StripeMetadata *stripeMetadata,
 									   uint32 columnCount);
-static StripeSkipList * LoadStripeSkipList(FILE *tableFile,
+static StripeSkipList * LoadStripeSkipList(Relation relation,
 										   StripeMetadata *stripeMetadata,
 										   StripeFooter *stripeFooter,
 										   uint32 columnCount,
@@ -81,9 +82,11 @@ static Datum ColumnDefaultValue(TupleConstr *tupleConstraints,
 								Form_pg_attribute attributeForm);
 static int64 FileSize(FILE *file);
 static StringInfo ReadFromFile(FILE *file, uint64 offset, uint32 size);
+static StringInfo ReadFromFileInternalStorage(Relation relation, uint64 offset, uint32 size);
 static void ResetUncompressedBlockData(ColumnBlockData **blockDataArray,
 									   uint32 columnCount);
 static uint64 StripeRowCount(FILE *tableFile, StripeMetadata *stripeMetadata);
+static uint64 StripeRowCountInternalStorage(Relation relation, StripeMetadata *stripeMetadata);
 
 
 /*
@@ -96,29 +99,16 @@ CStoreBeginRead(const char *filename, TupleDesc tupleDescriptor,
 {
 	TableReadState *readState = NULL;
 	TableFooter *tableFooter = NULL;
-	TableFooter *newTableFooter = NULL;
 	FILE *tableFile = NULL;
 	MemoryContext stripeReadContext = NULL;
 	uint32 columnCount = 0;
 	bool *projectedColumnMask = NULL;
 	ColumnBlockData **blockDataArray  = NULL;
-
 	StringInfo tableFooterFilename = makeStringInfo();
 	appendStringInfo(tableFooterFilename, "%s%s", filename, CSTORE_FOOTER_FILE_SUFFIX);
 
-	tableFooter = CStoreReadFooter(tableFooterFilename);
-	newTableFooter = CStoreReadFooterFromInternalStorage(tableFooterFilename, relation);
+	tableFooter = CStoreReadFooterFromInternalStorage(relation);
 
-	pfree(tableFooterFilename->data);
-	pfree(tableFooterFilename);
-
-	tableFile = AllocateFile(filename, PG_BINARY_R);
-	if (tableFile == NULL)
-	{
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("could not open file \"%s\" for reading: %m",
-							   filename)));
-	}
 
 	/*
 	 * We allocate all stripe specific data in the stripeReadContext, and reset
@@ -148,6 +138,7 @@ CStoreBeginRead(const char *filename, TupleDesc tupleDescriptor,
 	readState->stripeReadContext = stripeReadContext;
 	readState->blockDataArray = blockDataArray;
 	readState->deserializedBlockIndex = -1;
+	readState->relation = relation;
 
 	return readState;
 }
@@ -224,7 +215,7 @@ CStoreReadFooter(StringInfo tableFooterFilename)
 
 
 TableFooter *
-CStoreReadFooterFromInternalStorage(StringInfo tableFooterFilename, Relation relation)
+CStoreReadFooterFromInternalStorage(Relation relation)
 {
 	TableFooter *tableFooter = NULL;
 	uint64 footerOffset = 0;
@@ -234,58 +225,109 @@ CStoreReadFooterFromInternalStorage(StringInfo tableFooterFilename, Relation rel
 	uint8 postscriptSize = 0;
 	uint64 postscriptOffset = 0;
 	StringInfo footerBuffer = NULL;
-	SMgrRelation srel = NULL;
-	BackendId	backendId = InvalidBackendId;
-	char *relFileData = palloc0(BLCKSZ);
-	int32 relFileLength = 0;
+	int32 fileLength = 0;
 	BlockNumber blockCount = 0;
+	BlockNumber blockIndex = 0;
 	char *pageDataPayload = NULL;
 	const int headerLength = sizeof(int32);
+	char * footerData = NULL;
+	Buffer firstBuffer = InvalidBuffer;
+	Page page;
+	char *pageData = NULL;
 
 
-	srel = smgropen(relation->rd_node, backendId);
-	Assert(smgrexists(srel, MAIN_FORKNUM));
+	blockCount = RelationGetNumberOfBlocksInFork(relation, FOOTER_FORKNUM);
 
-	blockCount = smgrnblocks(srel, MAIN_FORKNUM);
 	ereport(WARNING, (errmsg("Found %d blocks in main fork", (int) blockCount)));
 
-	smgrread(srel, MAIN_FORKNUM, 0, relFileData);
-	memcpy(&relFileLength, relFileData, headerLength);
-	smgrclose(srel);
+	firstBuffer = ReadBufferExtended(relation, FOOTER_FORKNUM, 0, RBM_NORMAL, NULL);
 
-	if (relFileLength < CSTORE_POSTSCRIPT_SIZE_LENGTH)
+	LockBuffer(firstBuffer, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(firstBuffer);
+	pageData = PageGetContents(page);
+
+
+	if (pageData != NULL)
+	{
+		footerOffset = 40;
+		char *hexDump = palloc0(footerOffset * 2 + 2);
+		hex_encode(pageData, footerOffset, hexDump);
+		ereport(WARNING, (errmsg("relFileData hex dump : %s", hexDump)));
+	}
+
+	memcpy(&fileLength, VARDATA(pageData), headerLength);
+
+	ereport(WARNING, (errmsg("read size  : %d", (int)  VARSIZE(pageData))));
+	ereport(WARNING, (errmsg("fileLength : %d", (int) fileLength)));
+
+	if (fileLength < CSTORE_POSTSCRIPT_SIZE_LENGTH)
 	{
 		ereport(ERROR, (errmsg("invalid cstore file")));
 	}
 
+	footerData = (char *) palloc(fileLength);
+	footerOffset = 0;
 
-	pageDataPayload = relFileData + headerLength;
+	memcpy(footerData, VARDATA(pageData) + headerLength, VARSIZE(pageData) - headerLength);
+	footerOffset = VARSIZE(pageData) - headerLength;
 
-	postscriptSizeOffset = headerLength + relFileLength - CSTORE_POSTSCRIPT_SIZE_LENGTH;
-	memcpy(&postscriptSize, relFileData + postscriptSizeOffset, CSTORE_POSTSCRIPT_SIZE_LENGTH);
-	if (postscriptSize + CSTORE_POSTSCRIPT_SIZE_LENGTH > relFileLength)
+	for (blockIndex = 1; blockIndex < blockCount; blockIndex++)
+	{
+		Buffer buffer = ReadBufferExtended(relation, FOOTER_FORKNUM, blockIndex, RBM_NORMAL, NULL);
+		LockBuffer(buffer, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buffer);
+		pageData = PageGetContents(page);
+
+		memcpy(footerData + footerOffset, VARDATA(pageData), VARSIZE(pageData));
+		footerOffset += VARSIZE(pageData);
+		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+		ReleaseBuffer(buffer);
+	}
+
+	LockBuffer(firstBuffer, BUFFER_LOCK_UNLOCK);
+	ReleaseBuffer(firstBuffer);
+
+
+	ereport(WARNING, (errmsg("Read %d bytes for footer", (int) footerOffset)));
+
+	if (footerOffset > 0)
+	{
+		char *hexDump = palloc0(footerOffset * 2 + 2);
+		hex_encode(footerData, footerOffset, hexDump);
+		ereport(WARNING, (errmsg("footer hex dump : %s", hexDump)));
+	}
+	pageDataPayload = footerData;
+
+	postscriptSizeOffset = footerOffset - CSTORE_POSTSCRIPT_SIZE_LENGTH;
+	memcpy(&postscriptSize, footerData + postscriptSizeOffset, CSTORE_POSTSCRIPT_SIZE_LENGTH);
+
+	ereport(WARNING, (errmsg("PS size %d, PS offset %d", (int) postscriptSize, (int) postscriptOffset)));
+
+	if (postscriptSize + CSTORE_POSTSCRIPT_SIZE_LENGTH > fileLength)
 	{
 		ereport(ERROR, (errmsg("invalid postscript size")));
 	}
 
 	postscriptOffset = postscriptSizeOffset - postscriptSize;
 
+	ereport(WARNING, (errmsg("PS size %d, PS offset %d", (int) postscriptSize, (int) postscriptOffset)));
+
 	postscriptBuffer = makeStringInfo();
-	appendBinaryStringInfo(postscriptBuffer, relFileData + postscriptOffset, postscriptSize );
+	appendBinaryStringInfo(postscriptBuffer, footerData + postscriptOffset, postscriptSize );
 
 	DeserializePostScript(postscriptBuffer, &footerLength);
-	if (footerLength + postscriptSize + CSTORE_POSTSCRIPT_SIZE_LENGTH > relFileLength)
+	if (footerLength + postscriptSize + CSTORE_POSTSCRIPT_SIZE_LENGTH > fileLength)
 	{
 		ereport(ERROR, (errmsg("invalid footer size")));
 	}
 
 	footerOffset = postscriptOffset - footerLength;
 	footerBuffer = makeStringInfo();
-	appendBinaryStringInfo(footerBuffer, relFileData + footerOffset, footerLength);
+	appendBinaryStringInfo(footerBuffer, footerData + footerOffset, footerLength);
 
 	tableFooter = DeserializeTableFooter(footerBuffer);
 
-	pfree(relFileData);
+	pfree(footerData);
 	return tableFooter;
 }
 
@@ -326,7 +368,8 @@ CStoreReadNextRow(TableReadState *readState, Datum *columnValues, bool *columnNu
 		MemoryContextReset(readState->stripeReadContext);
 
 		stripeMetadata = list_nth(stripeMetadataList, readState->readStripeCount);
-		stripeBuffers = LoadFilteredStripeBuffers(readState->tableFile, stripeMetadata,
+
+		stripeBuffers = LoadFilteredStripeBuffers(readState->relation, stripeMetadata,
 												  readState->tupleDescriptor,
 												  readState->projectedColumnList,
 												  readState->whereClauseList);
@@ -464,7 +507,7 @@ FreeColumnBlockDataArray(ColumnBlockData **blockDataArray, uint32 columnCount)
 
 /* CStoreTableRowCount returns the exact row count of a table using skiplists */
 uint64
-CStoreTableRowCount(const char *filename)
+CStoreTableRowCount(const char *filename, Relation relation)
 {
 	TableFooter *tableFooter = NULL;
 	FILE *tableFile;
@@ -475,7 +518,9 @@ CStoreTableRowCount(const char *filename)
 
 	appendStringInfo(tableFooterFilename, "%s%s", filename, CSTORE_FOOTER_FILE_SUFFIX);
 
-	tableFooter = CStoreReadFooter(tableFooterFilename);
+	//tableFooter = CStoreReadFooter(tableFooterFilename);
+	tableFooter = CStoreReadFooterFromInternalStorage(relation);
+
 
 	pfree(tableFooterFilename->data);
 	pfree(tableFooterFilename);
@@ -494,6 +539,25 @@ CStoreTableRowCount(const char *filename)
 	}
 
 	FreeFile(tableFile);
+
+	return totalRowCount;
+}
+
+
+uint64
+CStoreTableRowCountInternalStorage(Relation relation)
+{
+	TableFooter *tableFooter = NULL;
+	ListCell *stripeMetadataCell = NULL;
+	uint64 totalRowCount = 0;
+
+	tableFooter = CStoreReadFooterFromInternalStorage(relation);
+
+	foreach(stripeMetadataCell, tableFooter->stripeMetadataList)
+	{
+		StripeMetadata *stripeMetadata = (StripeMetadata *) lfirst(stripeMetadataCell);
+		totalRowCount += StripeRowCountInternalStorage(relation, stripeMetadata);
+	}
 
 	return totalRowCount;
 }
@@ -527,13 +591,36 @@ StripeRowCount(FILE *tableFile, StripeMetadata *stripeMetadata)
 }
 
 
+static uint64
+StripeRowCountInternalStorage(Relation relation, StripeMetadata *stripeMetadata)
+{
+	uint64 rowCount = 0;
+	StripeFooter *stripeFooter = NULL;
+	StringInfo footerBuffer = NULL;
+	StringInfo firstColumnSkipListBuffer = NULL;
+	uint64 footerOffset = 0;
+
+	footerOffset += stripeMetadata->fileOffset;
+	footerOffset += stripeMetadata->skipListLength;
+	footerOffset += stripeMetadata->dataLength;
+
+	footerBuffer = ReadFromFileInternalStorage(relation, footerOffset, stripeMetadata->footerLength);
+	stripeFooter = DeserializeStripeFooter(footerBuffer);
+
+	firstColumnSkipListBuffer = ReadFromFileInternalStorage(relation, stripeMetadata->fileOffset,
+	                                         stripeFooter->skipListSizeArray[0]);
+	rowCount =  DeserializeRowCount(firstColumnSkipListBuffer);
+
+	return rowCount;
+}
+
 /*
  * LoadFilteredStripeBuffers reads serialized stripe data from the given file.
  * The function skips over blocks whose rows are refuted by restriction qualifiers,
  * and only loads columns that are projected in the query.
  */
 static StripeBuffers *
-LoadFilteredStripeBuffers(FILE *tableFile, StripeMetadata *stripeMetadata,
+LoadFilteredStripeBuffers(Relation relation, StripeMetadata *stripeMetadata,
 						  TupleDesc tupleDescriptor, List *projectedColumnList,
 						  List *whereClauseList)
 {
@@ -544,9 +631,9 @@ LoadFilteredStripeBuffers(FILE *tableFile, StripeMetadata *stripeMetadata,
 	Form_pg_attribute *attributeFormArray = tupleDescriptor->attrs;
 	uint32 columnCount = tupleDescriptor->natts;
 
-	StripeFooter *stripeFooter = LoadStripeFooter(tableFile, stripeMetadata,
+	StripeFooter *stripeFooter = LoadStripeFooter(relation, stripeMetadata,
 												  columnCount);
-	StripeSkipList *stripeSkipList = LoadStripeSkipList(tableFile, stripeMetadata,
+	StripeSkipList *stripeSkipList = LoadStripeSkipList(relation, stripeMetadata,
 														stripeFooter, columnCount,
 														attributeFormArray);
 
@@ -575,7 +662,7 @@ LoadFilteredStripeBuffers(FILE *tableFile, StripeMetadata *stripeMetadata,
 			Form_pg_attribute attributeForm = attributeFormArray[columnIndex];
 			uint32 blockCount = selectedBlockSkipList->blockCount;
 
-			ColumnBuffers *columnBuffers = LoadColumnBuffers(tableFile, blockSkipNode,
+			ColumnBuffers *columnBuffers = LoadColumnBuffers(relation, blockSkipNode,
 															 blockCount,
 															 existsFileOffset,
 															 valueFileOffset,
@@ -634,7 +721,7 @@ ReadStripeNextRow(StripeBuffers *stripeBuffers, List *projectedColumnList,
  * and lengths are retrieved from the column block skip node array.
  */
 static ColumnBuffers *
-LoadColumnBuffers(FILE *tableFile, ColumnBlockSkipNode *blockSkipNodeArray,
+LoadColumnBuffers(Relation relation, ColumnBlockSkipNode *blockSkipNodeArray,
 				  uint32 blockCount, uint64 existsFileOffset, uint64 valueFileOffset,
 				  Form_pg_attribute attributeForm)
 {
@@ -657,7 +744,7 @@ LoadColumnBuffers(FILE *tableFile, ColumnBlockSkipNode *blockSkipNodeArray,
 	{
 		ColumnBlockSkipNode *blockSkipNode = &blockSkipNodeArray[blockIndex];
 		uint64 existsOffset = existsFileOffset + blockSkipNode->existsBlockOffset;
-		StringInfo rawExistsBuffer = ReadFromFile(tableFile, existsOffset,
+		StringInfo rawExistsBuffer = ReadFromFileInternalStorage(relation, existsOffset,
 												  blockSkipNode->existsLength);
 
 		blockBuffersArray[blockIndex]->existsBuffer = rawExistsBuffer;
@@ -669,7 +756,7 @@ LoadColumnBuffers(FILE *tableFile, ColumnBlockSkipNode *blockSkipNodeArray,
 		ColumnBlockSkipNode *blockSkipNode = &blockSkipNodeArray[blockIndex];
 		CompressionType compressionType = blockSkipNode->valueCompressionType;
 		uint64 valueOffset = valueFileOffset + blockSkipNode->valueBlockOffset;
-		StringInfo rawValueBuffer = ReadFromFile(tableFile, valueOffset,
+		StringInfo rawValueBuffer = ReadFromFileInternalStorage(relation, valueOffset,
 												 blockSkipNode->valueLength);
 
 		blockBuffersArray[blockIndex]->valueBuffer = rawValueBuffer;
@@ -685,7 +772,7 @@ LoadColumnBuffers(FILE *tableFile, ColumnBlockSkipNode *blockSkipNodeArray,
 
 /* Reads and returns the given stripe's footer. */
 static StripeFooter *
-LoadStripeFooter(FILE *tableFile, StripeMetadata *stripeMetadata,
+LoadStripeFooter(Relation relation, StripeMetadata *stripeMetadata,
 				 uint32 columnCount)
 {
 	StripeFooter *stripeFooter = NULL;
@@ -696,7 +783,7 @@ LoadStripeFooter(FILE *tableFile, StripeMetadata *stripeMetadata,
 	footerOffset += stripeMetadata->skipListLength;
 	footerOffset += stripeMetadata->dataLength;
 
-	footerBuffer = ReadFromFile(tableFile, footerOffset, stripeMetadata->footerLength);
+	footerBuffer = ReadFromFileInternalStorage(relation, footerOffset, stripeMetadata->footerLength);
 	stripeFooter = DeserializeStripeFooter(footerBuffer);
 	if (stripeFooter->columnCount > columnCount)
 	{
@@ -710,7 +797,7 @@ LoadStripeFooter(FILE *tableFile, StripeMetadata *stripeMetadata,
 
 /* Reads the skip list for the given stripe. */
 static StripeSkipList *
-LoadStripeSkipList(FILE *tableFile, StripeMetadata *stripeMetadata,
+LoadStripeSkipList(Relation relation, StripeMetadata *stripeMetadata,
 				   StripeFooter *stripeFooter, uint32 columnCount,
 				   Form_pg_attribute *attributeFormArray)
 {
@@ -723,7 +810,7 @@ LoadStripeSkipList(FILE *tableFile, StripeMetadata *stripeMetadata,
 	uint32 stripeColumnCount = stripeFooter->columnCount;
 
 	/* deserialize block count */
-	firstColumnSkipListBuffer = ReadFromFile(tableFile, stripeMetadata->fileOffset,
+	firstColumnSkipListBuffer = ReadFromFileInternalStorage(relation, stripeMetadata->fileOffset,
 											 stripeFooter->skipListSizeArray[0]);
 	stripeBlockCount = DeserializeBlockCount(firstColumnSkipListBuffer);
 
@@ -737,7 +824,7 @@ LoadStripeSkipList(FILE *tableFile, StripeMetadata *stripeMetadata,
 		Form_pg_attribute attributeForm = attributeFormArray[columnIndex];
 
 		StringInfo columnSkipListBuffer =
-			ReadFromFile(tableFile, currentColumnSkipListFileOffset, columnSkipListSize);
+			ReadFromFileInternalStorage(relation, currentColumnSkipListFileOffset, columnSkipListSize);
 
 		ColumnBlockSkipNode *columnSkipList =
 			DeserializeColumnSkipList(columnSkipListBuffer, attributeForm->attbyval,
@@ -1384,6 +1471,91 @@ ReadFromFile(FILE *file, uint64 offset, uint32 size)
 						errmsg("could not read file: %m")));
 	}
 
+	return resultBuffer;
+}
+
+
+static StringInfo
+ReadFromFileInternalStorage(Relation relation, uint64 offset, uint32 size)
+{
+	int blockCapacity = BLCKSZ - sizeof(int32) - SizeOfPageHeaderData;
+	uint32 blockNumber = offset / blockCapacity;
+	uint32 blockOffset = offset % blockCapacity;
+	uint32 remainingSize = size;
+	uint32 resultOffset = 0;
+	uint32 blockCount = 0;
+	char *hexDump = palloc0(BLCKSZ * 2);
+
+	StringInfo resultBuffer = makeStringInfo();
+	enlargeStringInfo(resultBuffer, size);
+	resultBuffer->len = size;
+
+	if (size == 0)
+	{
+		return resultBuffer;
+	}
+
+	blockCount = RelationGetNumberOfBlocksInFork(relation,DATA_FORKNUM);
+	if (blockNumber > blockCount)
+	{
+		ereport(ERROR, (errmsg("could not read enough data from file")));
+	}
+
+	while (remainingSize > 0)
+	{
+		Buffer buffer = ReadBufferExtended(relation, DATA_FORKNUM, blockNumber, RBM_NORMAL, NULL);
+		Page page = NULL;
+		Size pageSize = 0;
+		char *pageContents = NULL;
+
+		LockBuffer(buffer, BUFFER_LOCK_SHARE);
+
+
+		page = BufferGetPage(buffer);
+		pageSize = PageGetPageSize(page);
+		pageContents = PageGetContents(page);
+		uint32 bufferSize = VARSIZE(pageContents);
+		uint32 copySize = remainingSize;
+
+		if (bufferSize < 0)
+		{
+			memset(hexDump, 0, BLCKSZ*2);
+			hex_encode(pageContents, bufferSize+4, hexDump);
+			ereport(WARNING, (errmsg("Read page %s", hexDump)));
+		}
+
+		if (copySize > (bufferSize - blockOffset))
+		{
+			copySize = bufferSize - blockOffset;
+		}
+
+		memcpy(resultBuffer->data + resultOffset, VARDATA(pageContents) + blockOffset, copySize);
+		remainingSize -= copySize;
+
+		if (resultBuffer->data == NULL)
+		{
+			memset(hexDump, 0, BLCKSZ*2);
+			hex_encode(resultBuffer->data, resultBuffer->len, hexDump);
+			ereport(WARNING, (errmsg("Returning %s", hexDump)));
+		}
+		UnlockReleaseBuffer(buffer);
+
+		if (remainingSize == 0)
+		{
+			break;
+		}
+
+		blockNumber++;
+		blockOffset = 0;
+		resultOffset += copySize;
+
+		if (blockNumber > blockCount)
+		{
+			ereport(ERROR, (errmsg("could not read enough data from file")));
+		}
+	}
+
+	pfree(hexDump);
 	return resultBuffer;
 }
 

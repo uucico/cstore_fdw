@@ -107,7 +107,7 @@ static ForeignScan * CStoreGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel
 										  Oid foreignTableId, ForeignPath *bestPath,
 										  List *targetList, List *scanClauses);
 #endif
-static double TupleCountEstimate(RelOptInfo *baserel, const char *filename);
+static double TupleCountEstimate(RelOptInfo *baserel, const char *filename, Relation relation);
 static BlockNumber PageCount(const char *filename);
 static List * ColumnList(RelOptInfo *baserel, Oid foreignTableId);
 static void CStoreExplainForeignScan(ForeignScanState *scanState,
@@ -472,7 +472,8 @@ CopyIntoCStoreTable(const CopyStmt *copyStatement, const char *queryString)
 								  cstoreFdwOptions->compressionType,
 								  cstoreFdwOptions->stripeRowCount,
 								  cstoreFdwOptions->blockRowCount,
-								  tupleDescriptor);
+								  tupleDescriptor,
+								  relation);
 	writeState->relation = relation;
 
 	while (nextRowFound)
@@ -743,7 +744,7 @@ static void InitializeCStoreTableFile(Oid relationId, Relation relation)
 	 */
 	writeState = CStoreBeginWrite(cstoreFdwOptions->filename,
 			cstoreFdwOptions->compressionType, cstoreFdwOptions->stripeRowCount,
-			cstoreFdwOptions->blockRowCount, tupleDescriptor);
+			cstoreFdwOptions->blockRowCount, tupleDescriptor, relation);
 
 	writeState->relation = relation;
 
@@ -1365,12 +1366,14 @@ static void
 CStoreGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreignTableId)
 {
 	CStoreFdwOptions *cstoreFdwOptions = CStoreGetOptions(foreignTableId);
-	double tupleCountEstimate = TupleCountEstimate(baserel, cstoreFdwOptions->filename);
+	Relation relation = heap_open(foreignTableId, AccessShareLock);
+	double tupleCountEstimate = TupleCountEstimate(baserel, cstoreFdwOptions->filename, relation);
 	double rowSelectivity = clauselist_selectivity(root, baserel->baserestrictinfo,
 												   0, JOIN_INNER, NULL);
 
 	double outputRowCount = clamp_row_est(tupleCountEstimate * rowSelectivity);
 	baserel->rows = outputRowCount;
+	heap_close(relation, AccessShareLock);
 }
 
 
@@ -1412,7 +1415,7 @@ CStoreGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreignTableId
 	double queryPageCount = relationPageCount * queryColumnRatio;
 	double totalDiskAccessCost = seq_page_cost * queryPageCount;
 
-	double tupleCountEstimate = TupleCountEstimate(baserel, cstoreFdwOptions->filename);
+	double tupleCountEstimate = TupleCountEstimate(baserel, cstoreFdwOptions->filename, relation);
 
 	/*
 	 * We estimate costs almost the same way as cost_seqscan(), thus assuming
@@ -1517,7 +1520,7 @@ CStoreGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreignTableId,
  * file.
  */
 static double
-TupleCountEstimate(RelOptInfo *baserel, const char *filename)
+TupleCountEstimate(RelOptInfo *baserel, const char *filename, Relation relation)
 {
 	double tupleCountEstimate = 0.0;
 
@@ -1536,7 +1539,8 @@ TupleCountEstimate(RelOptInfo *baserel, const char *filename)
 	}
 	else
 	{
-		tupleCountEstimate = (double) CStoreTableRowCount(filename);
+		//tupleCountEstimate = (double) CStoreTableRowCount(filename, relation);
+		tupleCountEstimate = (double) CStoreTableRowCountInternalStorage(relation);
 	}
 
 	return tupleCountEstimate;
@@ -2064,7 +2068,8 @@ CStoreBeginForeignModify(ModifyTableState *modifyTableState,
 								  cstoreFdwOptions->compressionType,
 								  cstoreFdwOptions->stripeRowCount,
 								  cstoreFdwOptions->blockRowCount,
-								  tupleDescriptor);
+								  tupleDescriptor,
+								  relation);
 
 	writeState->relation = relation;
 	relationInfo->ri_FdwState = (void *) writeState;

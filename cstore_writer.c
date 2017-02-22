@@ -26,14 +26,14 @@
 #include "port.h"
 #include "storage/fd.h"
 #include "storage/smgr.h"
+#include "utils/builtins.h"
 #include "utils/memutils.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 
 
 static void CStoreWriteFooter(StringInfo footerFileName, TableFooter *tableFooter);
-static void CStoreWriteFooterToInternalStorage(StringInfo tableFooterFilename,
-											   TableFooter *tableFooter,
+static void CStoreWriteFooterToInternalStorage(TableFooter *tableFooter,
 											   Relation relation);
 static StripeBuffers * CreateEmptyStripeBuffers(uint32 stripeMaxRowCount,
 												uint32 blockRowCount,
@@ -42,6 +42,7 @@ static StripeSkipList * CreateEmptyStripeSkipList(uint32 stripeMaxRowCount,
 												  uint32 blockRowCount,
 												  uint32 columnCount);
 static StripeMetadata FlushStripe(TableWriteState *writeState);
+static StripeMetadata FlushStripeToInternalStorage(TableWriteState *writeState);
 static StringInfo * CreateSkipListBufferArray(StripeSkipList *stripeSkipList,
 											  TupleDesc tupleDescriptor);
 static StripeFooter * CreateStripeFooter(StripeSkipList *stripeSkipList,
@@ -60,6 +61,7 @@ static Datum DatumCopy(Datum datum, bool datumTypeByValue, int datumTypeLength);
 static void AppendStripeMetadata(TableFooter *tableFooter,
 								 StripeMetadata stripeMetadata);
 static void WriteToFile(FILE *file, void *data, uint32 dataLength);
+static void WriteToInternalStorage(TableWriteState *writeState, void *data, uint32 dataLength);
 static void SyncAndCloseFile(FILE *file);
 static StringInfo CopyStringInfo(StringInfo sourceString);
 
@@ -74,7 +76,7 @@ static StringInfo CopyStringInfo(StringInfo sourceString);
 TableWriteState *
 CStoreBeginWrite(const char *filename, CompressionType compressionType,
 				 uint64 stripeMaxRowCount, uint32 blockRowCount,
-				 TupleDesc tupleDescriptor)
+				 TupleDesc tupleDescriptor, Relation relation)
 {
 	TableWriteState *writeState = NULL;
 	FILE *tableFile = NULL;
@@ -89,6 +91,10 @@ CStoreBeginWrite(const char *filename, CompressionType compressionType,
 	int statResult = 0;
 	bool *columnMaskArray = NULL;
 	ColumnBlockData **blockData = NULL;
+	int32 pageDataSize = BLCKSZ - sizeof(int32);
+	int32 blockNumber = 0;
+	int32 blockOffset = 0;
+	SMgrRelation srel = NULL;
 
 	tableFooterFilename = makeStringInfo();
 	appendStringInfo(tableFooterFilename, "%s%s", filename, CSTORE_FOOTER_FILE_SUFFIX);
@@ -118,7 +124,9 @@ CStoreBeginWrite(const char *filename, CompressionType compressionType,
 								   filename)));
 		}
 
-		tableFooter = CStoreReadFooter(tableFooterFilename);
+		//tableFooter = CStoreReadFooter(tableFooterFilename);
+		tableFooter = CStoreReadFooterFromInternalStorage(relation);
+
 	}
 
 	/*
@@ -147,6 +155,9 @@ CStoreBeginWrite(const char *filename, CompressionType compressionType,
 		}
 	}
 
+	blockNumber = currentFileOffset / pageDataSize;
+	blockOffset = currentFileOffset % pageDataSize;
+
 	/* get comparison function pointers for each of the columns */
 	columnCount = tupleDescriptor->natts;
 	comparisonFunctionArray = palloc0(columnCount * sizeof(FmgrInfo *));
@@ -165,6 +176,8 @@ CStoreBeginWrite(const char *filename, CompressionType compressionType,
 		comparisonFunctionArray[columnIndex] = comparisonFunction;
 	}
 
+
+
 	/*
 	 * We allocate all stripe specific data in the stripeWriteContext, and
 	 * reset this memory context once we have flushed the stripe to the file.
@@ -175,6 +188,17 @@ CStoreBeginWrite(const char *filename, CompressionType compressionType,
 											   ALLOCSET_DEFAULT_MINSIZE,
 											   ALLOCSET_DEFAULT_INITSIZE,
 											   ALLOCSET_DEFAULT_MAXSIZE);
+
+
+	srel = smgropen(relation->rd_node, InvalidBackendId);
+
+	if (!smgrexists(srel, DATA_FORKNUM))
+	{
+		ereport(WARNING, (errmsg("creating data fork")));
+		smgrcreate(srel, DATA_FORKNUM, false);
+	}
+
+	Assert(smgrexists(srel, DATA_FORKNUM));
 
 	columnMaskArray = palloc(columnCount * sizeof(bool));
 	memset(columnMaskArray, true, columnCount);
@@ -195,6 +219,9 @@ CStoreBeginWrite(const char *filename, CompressionType compressionType,
 	writeState->stripeWriteContext = stripeWriteContext;
 	writeState->blockDataArray = blockData;
 	writeState->compressionBuffer = NULL;
+	writeState->blockNumber = blockNumber;
+	writeState->blockOffset = blockOffset;
+	writeState->relfileNode = (void *) srel;
 
 	return writeState;
 }
@@ -292,7 +319,8 @@ CStoreWriteRow(TableWriteState *writeState, Datum *columnValues, bool *columnNul
 	stripeBuffers->rowCount++;
 	if (stripeBuffers->rowCount >= writeState->stripeMaxRowCount)
 	{
-		StripeMetadata stripeMetadata = FlushStripe(writeState);
+		//StripeMetadata stripeMetadata = FlushStripe(writeState);
+		StripeMetadata stripeMetadata = FlushStripeToInternalStorage(writeState);
 		MemoryContextReset(writeState->stripeWriteContext);
 
 		/* set stripe data and skip list to NULL so they are recreated next time */
@@ -332,7 +360,9 @@ CStoreEndWrite(TableWriteState *writeState)
 	{
 		MemoryContext oldContext = MemoryContextSwitchTo(writeState->stripeWriteContext);
 
-		StripeMetadata stripeMetadata = FlushStripe(writeState);
+		//StripeMetadata stripeMetadata = FlushStripe(writeState);
+		StripeMetadata stripeMetadata = FlushStripeToInternalStorage(writeState);
+
 		MemoryContextReset(writeState->stripeWriteContext);
 
 		MemoryContextSwitchTo(oldContext);
@@ -340,6 +370,7 @@ CStoreEndWrite(TableWriteState *writeState)
 	}
 
 	SyncAndCloseFile(writeState->tableFile);
+	smgrclose((SMgrRelation) writeState->relfileNode);
 
 	tableFooterFilename = writeState->tableFooterFilename;
 	tempTableFooterFileName = makeStringInfo();
@@ -347,7 +378,7 @@ CStoreEndWrite(TableWriteState *writeState)
 					 CSTORE_TEMP_FILE_SUFFIX);
 
 	CStoreWriteFooter(tempTableFooterFileName, writeState->tableFooter);
-	CStoreWriteFooterToInternalStorage(tempTableFooterFileName, writeState->tableFooter, writeState->relation);
+	CStoreWriteFooterToInternalStorage(writeState->tableFooter, writeState->relation);
 
 
 	renameResult = rename(tempTableFooterFileName->data, tableFooterFilename->data);
@@ -418,36 +449,27 @@ CStoreWriteFooter(StringInfo tableFooterFilename, TableFooter *tableFooter)
 
 
 static void
-CStoreWriteFooterToInternalStorage(StringInfo tableFooterFilename,
-								   TableFooter *tableFooter, Relation relation)
+CStoreWriteFooterToInternalStorage(TableFooter *tableFooter, Relation relation)
 {
 	StringInfo tableFooterBuffer = NULL;
 	StringInfo postscriptBuffer = NULL;
 	uint8 postscriptSize = 0;
-	SMgrRelation srel;
-	BackendId	backendId = InvalidBackendId;
-	BlockNumber blockCount = 0;
+	BlockNumber originalBlockCount = 0;
+	BlockNumber actualBlockCount = 0;
+	BlockNumber currentBlockNumber = 0;
 	StringInfo wholeFooter = makeStringInfo();
 	char *pageData = NULL;
 	int32 dataLength = 0;
+	int32 dataOffset = 0;
+	int32 blockDataSize =  BLCKSZ - SizeOfPageHeaderData - VARHDRSZ;
 
 
-	srel = smgropen(relation->rd_node, backendId);
-	Assert(smgrexists(srel, MAIN_FORKNUM));
 
-	blockCount = smgrnblocks(srel, MAIN_FORKNUM);
-
-	ereport(WARNING, (errmsg("Found %d blocks in main fork, will truncate", (int) blockCount)));
-	smgrtruncate(srel, MAIN_FORKNUM, blockCount);
-
-	smgrclose(srel);
-	srel = smgropen(relation->rd_node, backendId);
+	originalBlockCount = RelationGetNumberOfBlocksInFork(relation, FOOTER_FORKNUM);
+	ereport(WARNING, (errmsg("Found %d blocks in main fork", (int) originalBlockCount)));
 
 
-	blockCount = smgrnblocks(srel, MAIN_FORKNUM);
-	ereport(WARNING, (errmsg("%d blocks in main fork after truncate", (int) blockCount)));
-
-
+	appendBinaryStringInfo(wholeFooter, (const char *) &dataLength, sizeof(int32));
 	/* write the footer */
 	tableFooterBuffer = SerializeTableFooter(tableFooter);
 	appendBinaryStringInfo(wholeFooter, tableFooterBuffer->data, tableFooterBuffer->len);
@@ -465,18 +487,65 @@ CStoreWriteFooterToInternalStorage(StringInfo tableFooterFilename,
 
 	dataLength = wholeFooter->len;
 
+
+
+	actualBlockCount = (dataLength - 1) / blockDataSize + 1;
+	ereport(WARNING, (errmsg("Needs %d blocks for footer", actualBlockCount)));
+
 	pageData = (char *) palloc0(BLCKSZ);
-	memcpy(pageData, &dataLength, sizeof(int32));
-	memcpy(pageData + sizeof(int32), wholeFooter->data, wholeFooter->len);
-	smgrextend(srel, MAIN_FORKNUM, 0, pageData, false);
-	smgrclose(srel);
+
+	dataOffset = 0;
+
+	memcpy(wholeFooter->data, (const char*) &dataLength, sizeof(int32));
+
+	for (currentBlockNumber = 0; currentBlockNumber < actualBlockCount; currentBlockNumber++)
+	{
+		Buffer buffer = InvalidBuffer;
+		BlockNumber blockNumber = currentBlockNumber;
+		Page page;
+		char * pageData = NULL;
+		BlockNumber actualBlockNumber = InvalidBlockNumber;
+
+
+		if (blockNumber >= originalBlockCount)
+		{
+			blockNumber = P_NEW;
+		}
+
+		buffer = ReadBufferExtended(relation, FOOTER_FORKNUM, blockNumber, RBM_NORMAL, NULL);
+
+		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+		page = BufferGetPage(buffer);
+
+		PageInit(page, BLCKSZ, 0);
+		pageData = PageGetContents(page);
+
+		ereport(WARNING, (errmsg("Writing block %d", currentBlockNumber)));
+
+		int copySize = blockDataSize;
+
+		if ( (dataLength - dataOffset) <= blockDataSize)
+		{
+			copySize = dataLength - dataOffset;
+		}
+
+		SET_VARSIZE(pageData, copySize);
+		memcpy(VARDATA(pageData), wholeFooter->data + dataOffset, copySize);
+
+		MarkBufferDirty(buffer);
+		actualBlockNumber = BufferGetBlockNumber(buffer);
+		log_newpage(&relation->rd_node, FOOTER_FORKNUM, actualBlockNumber, (char *) page, false);
+		UnlockReleaseBuffer(buffer);
+
+		dataOffset += copySize;
+
+	}
 
 	pfree(tableFooterBuffer->data);
 	pfree(tableFooterBuffer);
 	pfree(postscriptBuffer->data);
 	pfree(postscriptBuffer);
 
-	pfree(pageData);
 	pfree(wholeFooter->data);
 	pfree(wholeFooter);
 }
@@ -671,6 +740,140 @@ FlushStripe(TableWriteState *writeState)
 
 	/* finally, we flush the footer buffer */
 	WriteToFile(tableFile, stripeFooterBuffer->data, stripeFooterBuffer->len);
+
+	/* set stripe metadata */
+	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
+	{
+		skipListLength += stripeFooter->skipListSizeArray[columnIndex];
+		dataLength += stripeFooter->existsSizeArray[columnIndex];
+		dataLength += stripeFooter->valueSizeArray[columnIndex];
+	}
+
+	stripeMetadata.fileOffset = writeState->currentFileOffset;
+	stripeMetadata.skipListLength = skipListLength;
+	stripeMetadata.dataLength = dataLength;
+	stripeMetadata.footerLength = stripeFooterBuffer->len;
+
+	/* advance current file offset */
+	writeState->currentFileOffset += skipListLength;
+	writeState->currentFileOffset += dataLength;
+	writeState->currentFileOffset += stripeFooterBuffer->len;
+
+	return stripeMetadata;
+}
+
+static StripeMetadata
+FlushStripeToInternalStorage(TableWriteState *writeState)
+{
+	StripeMetadata stripeMetadata = {0, 0, 0, 0};
+	uint64 skipListLength = 0;
+	uint64 dataLength = 0;
+	StringInfo *skipListBufferArray = NULL;
+	StripeFooter *stripeFooter = NULL;
+	StringInfo stripeFooterBuffer = NULL;
+	uint32 columnIndex = 0;
+	uint32 blockIndex = 0;
+	TableFooter *tableFooter = writeState->tableFooter;
+	StripeBuffers *stripeBuffers = writeState->stripeBuffers;
+	StripeSkipList *stripeSkipList = writeState->stripeSkipList;
+	ColumnBlockSkipNode **columnSkipNodeArray = stripeSkipList->blockSkipNodeArray;
+	TupleDesc tupleDescriptor = writeState->tupleDescriptor;
+	uint32 columnCount = tupleDescriptor->natts;
+	uint32 blockCount = stripeSkipList->blockCount;
+	uint32 blockRowCount = tableFooter->blockRowCount;
+	uint32 lastBlockIndex = stripeBuffers->rowCount / blockRowCount;
+	uint32 lastBlockRowCount = stripeBuffers->rowCount % blockRowCount;
+
+	/*
+	 * check if the last block needs serialization , the last block was not serialized
+	 * if it was not full yet, e.g.  (rowCount > 0)
+	 */
+	if (lastBlockRowCount > 0)
+	{
+		SerializeBlockData(writeState, lastBlockIndex, lastBlockRowCount);
+	}
+
+	/* update buffer sizes and positions in stripe skip list */
+	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
+	{
+		ColumnBlockSkipNode *blockSkipNodeArray = columnSkipNodeArray[columnIndex];
+		uint64 currentExistsBlockOffset = 0;
+		uint64 currentValueBlockOffset = 0;
+		ColumnBuffers *columnBuffers = stripeBuffers->columnBuffersArray[columnIndex];
+
+		for (blockIndex = 0; blockIndex < blockCount; blockIndex++)
+		{
+			ColumnBlockBuffers *blockBuffers =
+					columnBuffers->blockBuffersArray[blockIndex];
+			uint64 existsBufferSize = blockBuffers->existsBuffer->len;
+			uint64 valueBufferSize = blockBuffers->valueBuffer->len;
+			CompressionType valueCompressionType = blockBuffers->valueCompressionType;
+			ColumnBlockSkipNode *blockSkipNode = &blockSkipNodeArray[blockIndex];
+
+			blockSkipNode->existsBlockOffset = currentExistsBlockOffset;
+			blockSkipNode->existsLength = existsBufferSize;
+			blockSkipNode->valueBlockOffset = currentValueBlockOffset;
+			blockSkipNode->valueLength = valueBufferSize;
+			blockSkipNode->valueCompressionType = valueCompressionType;
+
+			currentExistsBlockOffset += existsBufferSize;
+			currentValueBlockOffset += valueBufferSize;
+		}
+	}
+
+	/* create skip list and footer buffers */
+	skipListBufferArray = CreateSkipListBufferArray(stripeSkipList, tupleDescriptor);
+	stripeFooter = CreateStripeFooter(stripeSkipList, skipListBufferArray);
+	stripeFooterBuffer = SerializeStripeFooter(stripeFooter);
+
+	/*
+	 * Each stripe has three sections:
+	 * (1) Skip list, which contains statistics for each column block, and can
+	 * be used to skip reading row blocks that are refuted by WHERE clause list,
+	 * (2) Data section, in which we store data for each column continuously.
+	 * We store data for each for each column in blocks. For each block, we
+	 * store two buffers: "exists" buffer, and "value" buffer. "exists" buffer
+	 * tells which values are not NULL. "value" buffer contains values for
+	 * present values. For each column, we first store all "exists" buffers,
+	 * and then all "value" buffers.
+	 * (3) Stripe footer, which contains the skip list buffer size, exists buffer
+	 * size, and value buffer size for each of the columns.
+	 *
+	 * We start by flushing the skip list buffers.
+	 */
+	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
+	{
+		StringInfo skipListBuffer = skipListBufferArray[columnIndex];
+		WriteToInternalStorage(writeState, skipListBuffer->data, skipListBuffer->len);
+	}
+
+	/* then, we flush the data buffers */
+	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
+	{
+		ColumnBuffers *columnBuffers = stripeBuffers->columnBuffersArray[columnIndex];
+		uint32 blockIndex = 0;
+
+		for (blockIndex = 0; blockIndex < stripeSkipList->blockCount; blockIndex++)
+		{
+			ColumnBlockBuffers *blockBuffers =
+					columnBuffers->blockBuffersArray[blockIndex];
+			StringInfo existsBuffer = blockBuffers->existsBuffer;
+
+			WriteToInternalStorage(writeState, existsBuffer->data, existsBuffer->len);
+		}
+
+		for (blockIndex = 0; blockIndex < stripeSkipList->blockCount; blockIndex++)
+		{
+			ColumnBlockBuffers *blockBuffers =
+					columnBuffers->blockBuffersArray[blockIndex];
+			StringInfo valueBuffer = blockBuffers->valueBuffer;
+
+			WriteToInternalStorage(writeState, valueBuffer->data, valueBuffer->len);
+		}
+	}
+
+	/* finally, we flush the footer buffer */
+	WriteToInternalStorage(writeState, stripeFooterBuffer->data, stripeFooterBuffer->len);
 
 	/* set stripe metadata */
 	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
@@ -1023,6 +1226,93 @@ WriteToFile(FILE *file, void *data, uint32 dataLength)
 	}
 }
 
+
+static void
+WriteToInternalStorage(TableWriteState *writeState, void *data, uint32 dataLength)
+{
+	int32 blockNumber = writeState->blockNumber;
+	int32 blockOffset = writeState->blockOffset;
+	char *hexDump = palloc0(BLCKSZ * 2);
+
+	int blockCapacity = BLCKSZ - sizeof(int32) - SizeOfPageHeaderData;
+
+	int dataOffset = 0;
+	Relation relation = writeState->relation;
+	BlockNumber blockCount = RelationGetNumberOfBlocksInFork(relation, DATA_FORKNUM);
+
+	if (dataLength == 0)
+	{
+		return;
+	}
+
+	while (dataOffset < dataLength)
+	{
+		Page page = NULL;
+		char *pageData = NULL;
+		Buffer buffer = InvalidBuffer;
+		int32 copySize = 0;
+		int usedSize = 0;
+		int remainingCapacity = 0;
+		BlockNumber actualBlockNumber = InvalidBlockNumber;
+
+		if (blockNumber >= blockCount)
+		{
+			blockNumber = P_NEW;
+		}
+
+		buffer = ReadBufferExtended(relation, DATA_FORKNUM, blockNumber, RBM_NORMAL, NULL);
+
+		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+		page = BufferGetPage(buffer);
+
+		if (blockNumber == P_NEW)
+		{
+			PageInit(page, BLCKSZ, 0);
+		}
+
+		pageData = PageGetContents(page);
+
+		usedSize = VARSIZE(pageData);
+		remainingCapacity = blockCapacity - usedSize;
+		copySize = dataLength - dataOffset;
+
+		if (remainingCapacity < copySize)
+		{
+			copySize = remainingCapacity;
+		}
+		ereport(WARNING, (errmsg("Writing %d bytes to buffer %d at offset %d", (int) copySize , (int) blockNumber, (int) usedSize)));
+		memcpy(VARDATA(pageData) + usedSize, (char *) data + dataOffset, copySize);
+		usedSize += copySize;
+
+
+		if (usedSize < 0)
+		{
+			hex_encode((char *) data + dataOffset, copySize, hexDump);
+			ereport(WARNING, (errmsg("wrote : %s", hexDump)));
+
+			hex_encode(pageData, usedSize+4, hexDump);
+			ereport(WARNING, (errmsg("buffer after writing : %s", hexDump)));
+
+		}
+
+		dataOffset += copySize;
+
+		if (blockNumber != P_NEW)
+		{
+			blockNumber++;
+		}
+		blockOffset = 0;
+
+		SET_VARSIZE(pageData, usedSize);
+
+		MarkBufferDirty(buffer);
+		actualBlockNumber = BufferGetBlockNumber(buffer);
+		log_newpage(&relation->rd_node, DATA_FORKNUM, actualBlockNumber, (char *) page, false);
+		UnlockReleaseBuffer(buffer);
+	}
+
+	pfree(hexDump);
+}
 
 /* Flushes, syncs, and closes the given file pointer and checks for errors. */
 static void

@@ -67,7 +67,8 @@
 #define ATTR_NUM_PARTITION_TYPE 2
 #define ATTR_NUM_PARTITION_KEY 3
 
-
+#define FOOTER_FORKNUM MAIN_FORKNUM
+#define DATA_FORKNUM FSM_FORKNUM
 /*
  * CStoreValidOption keeps an option name and a context. When an option is passed
  * into cstore_fdw objects (server and foreign table), we compare this option's
@@ -272,6 +273,7 @@ typedef struct TableReadState
 	uint64 stripeReadRowCount;
 	ColumnBlockData **blockDataArray;
 	int32 deserializedBlockIndex;
+	Relation relation;
 
 } TableReadState;
 
@@ -287,6 +289,9 @@ typedef struct TableWriteState
 	FmgrInfo **comparisonFunctionArray;
 	uint64 currentFileOffset;
 	Relation relation;
+	void *relfileNode;
+	int32 blockNumber;
+	int32 blockOffset;
 
 	MemoryContext stripeWriteContext;
 	StripeBuffers *stripeBuffers;
@@ -322,7 +327,8 @@ extern TableWriteState * CStoreBeginWrite(const char *filename,
 										  CompressionType compressionType,
 										  uint64 stripeMaxRowCount,
 										  uint32 blockRowCount,
-										  TupleDesc tupleDescriptor);
+										  TupleDesc tupleDescriptor,
+										  Relation relation);
 extern void CStoreWriteRow(TableWriteState *state, Datum *columnValues,
 						   bool *columnNulls);
 extern void CStoreEndWrite(TableWriteState * state);
@@ -331,7 +337,7 @@ extern void CStoreEndWrite(TableWriteState * state);
 extern TableReadState * CStoreBeginRead(const char *filename, TupleDesc tupleDescriptor,
 										List *projectedColumnList, List *qualConditions, Relation relation);
 extern TableFooter * CStoreReadFooter(StringInfo tableFooterFilename);
-extern TableFooter * CStoreReadFooterFromInternalStorage(StringInfo tableFooterFilename, Relation relation);
+extern TableFooter * CStoreReadFooterFromInternalStorage(Relation relation);
 extern bool CStoreReadFinished(TableReadState *state);
 extern bool CStoreReadNextRow(TableReadState *state, Datum *columnValues,
 							  bool *columnNulls);
@@ -344,7 +350,8 @@ extern ColumnBlockData ** CreateEmptyBlockDataArray(uint32 columnCount, bool *co
 													uint32 blockRowCount);
 extern void FreeColumnBlockDataArray(ColumnBlockData **blockDataArray,
 									 uint32 columnCount);
-extern uint64 CStoreTableRowCount(const char *filename);
+extern uint64 CStoreTableRowCount(const char *filename, Relation relation);
+extern uint64 CStoreTableRowCountInternalStorage(Relation relation);
 extern bool CompressBuffer(StringInfo inputBuffer, StringInfo outputBuffer,
 						   CompressionType compressionType);
 extern StringInfo DecompressBuffer(StringInfo buffer, CompressionType compressionType);
