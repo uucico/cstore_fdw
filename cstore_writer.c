@@ -461,7 +461,7 @@ CStoreWriteFooterToInternalStorage(TableFooter *tableFooter, Relation relation)
 	char *pageData = NULL;
 	int32 dataLength = 0;
 	int32 dataOffset = 0;
-	int32 blockDataSize =  BLCKSZ - SizeOfPageHeaderData - VARHDRSZ;
+	int32 blockDataSize =  BLCKSZ - SizeOfPageHeaderData;
 
 
 
@@ -503,6 +503,7 @@ CStoreWriteFooterToInternalStorage(TableFooter *tableFooter, Relation relation)
 		Buffer buffer = InvalidBuffer;
 		BlockNumber blockNumber = currentBlockNumber;
 		Page page;
+		PageHeader pageHeader = NULL;
 		char * pageData = NULL;
 		BlockNumber actualBlockNumber = InvalidBlockNumber;
 
@@ -529,8 +530,9 @@ CStoreWriteFooterToInternalStorage(TableFooter *tableFooter, Relation relation)
 			copySize = dataLength - dataOffset;
 		}
 
-		SET_VARSIZE(pageData, copySize);
-		memcpy(VARDATA(pageData), wholeFooter->data + dataOffset, copySize);
+		pageHeader = (PageHeader) page;
+		pageHeader->pd_lower = SizeOfPageHeaderData + copySize;
+		memcpy(pageData, wholeFooter->data + dataOffset, copySize);
 
 		MarkBufferDirty(buffer);
 		actualBlockNumber = BufferGetBlockNumber(buffer);
@@ -1234,7 +1236,7 @@ WriteToInternalStorage(TableWriteState *writeState, void *data, uint32 dataLengt
 	int32 blockOffset = writeState->blockOffset;
 	char *hexDump = palloc0(BLCKSZ * 2);
 
-	int blockCapacity = BLCKSZ - sizeof(int32) - SizeOfPageHeaderData;
+	int blockCapacity = BLCKSZ - SizeOfPageHeaderData;
 
 	int dataOffset = 0;
 	Relation relation = writeState->relation;
@@ -1254,6 +1256,7 @@ WriteToInternalStorage(TableWriteState *writeState, void *data, uint32 dataLengt
 		int usedSize = 0;
 		int remainingCapacity = 0;
 		BlockNumber actualBlockNumber = InvalidBlockNumber;
+		PageHeader pageHeader = NULL;
 
 		if (blockNumber >= blockCount)
 		{
@@ -1264,15 +1267,19 @@ WriteToInternalStorage(TableWriteState *writeState, void *data, uint32 dataLengt
 
 		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 		page = BufferGetPage(buffer);
+		pageHeader = (PageHeader ) page;
 
 		if (blockNumber == P_NEW)
 		{
 			PageInit(page, BLCKSZ, 0);
+
 		}
 
 		pageData = PageGetContents(page);
+		Assert(pageHeader->pd_lower > 0);
 
-		usedSize = VARSIZE(pageData);
+
+		usedSize = (pageHeader->pd_lower) - SizeOfPageHeaderData;
 		remainingCapacity = blockCapacity - usedSize;
 		copySize = dataLength - dataOffset;
 
@@ -1281,7 +1288,7 @@ WriteToInternalStorage(TableWriteState *writeState, void *data, uint32 dataLengt
 			copySize = remainingCapacity;
 		}
 //		ereport(WARNING, (errmsg("Writing %d bytes to buffer %d at offset %d", (int) copySize , (int) blockNumber, (int) usedSize)));
-		memcpy(VARDATA(pageData) + usedSize, (char *) data + dataOffset, copySize);
+		memcpy(pageData + usedSize, (char *) data + dataOffset, copySize);
 		usedSize += copySize;
 
 
@@ -1303,7 +1310,13 @@ WriteToInternalStorage(TableWriteState *writeState, void *data, uint32 dataLengt
 		}
 		blockOffset = 0;
 
-		SET_VARSIZE(pageData, usedSize);
+		pageHeader->pd_lower += copySize;
+		//SET_VARSIZE(pageData, usedSize);
+		if (pageHeader->pd_lower >= pageHeader->pd_upper)
+		{
+//			ereport(WARNING, (errmsg("marking page full")));
+			pageHeader->pd_flags |= PD_PAGE_FULL;
+		}
 
 		MarkBufferDirty(buffer);
 		actualBlockNumber = BufferGetBlockNumber(buffer);

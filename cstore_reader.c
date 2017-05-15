@@ -232,8 +232,10 @@ CStoreReadFooterFromInternalStorage(Relation relation)
 	const int headerLength = sizeof(int32);
 	char * footerData = NULL;
 	Buffer firstBuffer = InvalidBuffer;
-	Page page;
+	Page page = NULL;
 	char *pageData = NULL;
+	int pageDataLength = 0;
+	PageHeader pageHeader = NULL;
 
 
 	blockCount = RelationGetNumberOfBlocksInFork(relation, FOOTER_FORKNUM);
@@ -244,7 +246,9 @@ CStoreReadFooterFromInternalStorage(Relation relation)
 
 	LockBuffer(firstBuffer, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(firstBuffer);
+	pageHeader = (PageHeader) page;
 	pageData = PageGetContents(page);
+
 
 
 	if (pageData != NULL && false)
@@ -255,7 +259,7 @@ CStoreReadFooterFromInternalStorage(Relation relation)
 		ereport(WARNING, (errmsg("relFileData hex dump : %s", hexDump)));
 	}
 
-	memcpy(&fileLength, VARDATA(pageData), headerLength);
+	memcpy(&fileLength, pageData, headerLength);
 
 //	ereport(WARNING, (errmsg("read size  : %d", (int)  VARSIZE(pageData))));
 //	ereport(WARNING, (errmsg("fileLength : %d", (int) fileLength)));
@@ -268,18 +272,21 @@ CStoreReadFooterFromInternalStorage(Relation relation)
 	footerData = (char *) palloc(fileLength);
 	footerOffset = 0;
 
-	memcpy(footerData, VARDATA(pageData) + headerLength, VARSIZE(pageData) - headerLength);
-	footerOffset = VARSIZE(pageData) - headerLength;
+	pageDataLength = pageHeader->pd_lower - SizeOfPageHeaderData - headerLength;
+	memcpy(footerData, pageData + headerLength, pageDataLength);
+	footerOffset = pageDataLength;
 
 	for (blockIndex = 1; blockIndex < blockCount; blockIndex++)
 	{
 		Buffer buffer = ReadBufferExtended(relation, FOOTER_FORKNUM, blockIndex, RBM_NORMAL, NULL);
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buffer);
+		pageHeader = (PageHeader) page;
 		pageData = PageGetContents(page);
 
-		memcpy(footerData + footerOffset, VARDATA(pageData), VARSIZE(pageData));
-		footerOffset += VARSIZE(pageData);
+		pageDataLength = pageHeader->pd_lower - SizeOfPageHeaderData;
+		memcpy(footerData + footerOffset, pageData, pageDataLength);
+		footerOffset += pageDataLength;
 		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 		ReleaseBuffer(buffer);
 	}
@@ -1478,7 +1485,7 @@ ReadFromFile(FILE *file, uint64 offset, uint32 size)
 static StringInfo
 ReadFromFileInternalStorage(Relation relation, uint64 offset, uint32 size)
 {
-	int blockCapacity = BLCKSZ - sizeof(int32) - SizeOfPageHeaderData;
+	int blockCapacity = BLCKSZ - SizeOfPageHeaderData;
 	uint32 blockNumber = offset / blockCapacity;
 	uint32 blockOffset = offset % blockCapacity;
 	uint32 remainingSize = size;
@@ -1507,20 +1514,22 @@ ReadFromFileInternalStorage(Relation relation, uint64 offset, uint32 size)
 		Page page = NULL;
 		Size pageSize = 0;
 		char *pageContents = NULL;
+		PageHeader pageHeader = NULL;
 
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
 
 
 		page = BufferGetPage(buffer);
+		pageHeader = (PageHeader ) page;
 		pageSize = PageGetPageSize(page);
 		pageContents = PageGetContents(page);
-		uint32 bufferSize = VARSIZE(pageContents);
+		uint32 bufferSize = pageHeader->pd_lower - SizeOfPageHeaderData;
 		uint32 copySize = remainingSize;
 
 		if (bufferSize > 0 && false)
 		{
 			memset(hexDump, 0, BLCKSZ*2);
-			hex_encode(pageContents, bufferSize+4, hexDump);
+			hex_encode(pageContents, bufferSize, hexDump);
 			ereport(WARNING, (errmsg("Read page %s", hexDump)));
 		}
 
@@ -1529,7 +1538,7 @@ ReadFromFileInternalStorage(Relation relation, uint64 offset, uint32 size)
 			copySize = bufferSize - blockOffset;
 		}
 
-		memcpy(resultBuffer->data + resultOffset, VARDATA(pageContents) + blockOffset, copySize);
+		memcpy(resultBuffer->data + resultOffset, pageContents + blockOffset, copySize);
 		remainingSize -= copySize;
 
 		if (resultBuffer->data == NULL)
