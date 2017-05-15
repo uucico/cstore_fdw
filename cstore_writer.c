@@ -194,7 +194,7 @@ CStoreBeginWrite(const char *filename, CompressionType compressionType,
 
 	if (!smgrexists(srel, DATA_FORKNUM))
 	{
-		ereport(WARNING, (errmsg("creating data fork")));
+		//ereport(WARNING, (errmsg("creating data fork")));
 		smgrcreate(srel, DATA_FORKNUM, false);
 	}
 
@@ -466,7 +466,7 @@ CStoreWriteFooterToInternalStorage(TableFooter *tableFooter, Relation relation)
 
 
 	originalBlockCount = RelationGetNumberOfBlocksInFork(relation, FOOTER_FORKNUM);
-	ereport(WARNING, (errmsg("Found %d blocks in main fork", (int) originalBlockCount)));
+//	ereport(WARNING, (errmsg("Found %d blocks in main fork", (int) originalBlockCount)));
 
 
 	appendBinaryStringInfo(wholeFooter, (const char *) &dataLength, sizeof(int32));
@@ -483,14 +483,14 @@ CStoreWriteFooterToInternalStorage(TableFooter *tableFooter, Relation relation)
 	postscriptSize = postscriptBuffer->len;
 	appendBinaryStringInfo(wholeFooter, (char *) &postscriptSize, CSTORE_POSTSCRIPT_SIZE_LENGTH);
 
-	ereport(WARNING, (errmsg("Footer size %d bytes", wholeFooter->len)));
+//	ereport(WARNING, (errmsg("Footer size %d bytes", wholeFooter->len)));
 
 	dataLength = wholeFooter->len;
 
 
 
 	actualBlockCount = (dataLength - 1) / blockDataSize + 1;
-	ereport(WARNING, (errmsg("Needs %d blocks for footer", actualBlockCount)));
+//	ereport(WARNING, (errmsg("Needs %d blocks for footer", actualBlockCount)));
 
 	pageData = (char *) palloc0(BLCKSZ);
 
@@ -520,7 +520,7 @@ CStoreWriteFooterToInternalStorage(TableFooter *tableFooter, Relation relation)
 		PageInit(page, BLCKSZ, 0);
 		pageData = PageGetContents(page);
 
-		ereport(WARNING, (errmsg("Writing block %d", currentBlockNumber)));
+//		ereport(WARNING, (errmsg("Writing block %d", currentBlockNumber)));
 
 		int copySize = blockDataSize;
 
@@ -1280,7 +1280,7 @@ WriteToInternalStorage(TableWriteState *writeState, void *data, uint32 dataLengt
 		{
 			copySize = remainingCapacity;
 		}
-		ereport(WARNING, (errmsg("Writing %d bytes to buffer %d at offset %d", (int) copySize , (int) blockNumber, (int) usedSize)));
+//		ereport(WARNING, (errmsg("Writing %d bytes to buffer %d at offset %d", (int) copySize , (int) blockNumber, (int) usedSize)));
 		memcpy(VARDATA(pageData) + usedSize, (char *) data + dataOffset, copySize);
 		usedSize += copySize;
 

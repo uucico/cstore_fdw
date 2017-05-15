@@ -238,7 +238,7 @@ CStoreReadFooterFromInternalStorage(Relation relation)
 
 	blockCount = RelationGetNumberOfBlocksInFork(relation, FOOTER_FORKNUM);
 
-	ereport(WARNING, (errmsg("Found %d blocks in main fork", (int) blockCount)));
+//	ereport(WARNING, (errmsg("Found %d blocks in main fork", (int) blockCount)));
 
 	firstBuffer = ReadBufferExtended(relation, FOOTER_FORKNUM, 0, RBM_NORMAL, NULL);
 
@@ -247,7 +247,7 @@ CStoreReadFooterFromInternalStorage(Relation relation)
 	pageData = PageGetContents(page);
 
 
-	if (pageData != NULL)
+	if (pageData != NULL && false)
 	{
 		footerOffset = 40;
 		char *hexDump = palloc0(footerOffset * 2 + 2);
@@ -257,8 +257,8 @@ CStoreReadFooterFromInternalStorage(Relation relation)
 
 	memcpy(&fileLength, VARDATA(pageData), headerLength);
 
-	ereport(WARNING, (errmsg("read size  : %d", (int)  VARSIZE(pageData))));
-	ereport(WARNING, (errmsg("fileLength : %d", (int) fileLength)));
+//	ereport(WARNING, (errmsg("read size  : %d", (int)  VARSIZE(pageData))));
+//	ereport(WARNING, (errmsg("fileLength : %d", (int) fileLength)));
 
 	if (fileLength < CSTORE_POSTSCRIPT_SIZE_LENGTH)
 	{
@@ -288,9 +288,9 @@ CStoreReadFooterFromInternalStorage(Relation relation)
 	ReleaseBuffer(firstBuffer);
 
 
-	ereport(WARNING, (errmsg("Read %d bytes for footer", (int) footerOffset)));
+//	ereport(WARNING, (errmsg("Read %d bytes for footer", (int) footerOffset)));
 
-	if (footerOffset > 0)
+	if (footerOffset > 0 && false)
 	{
 		char *hexDump = palloc0(footerOffset * 2 + 2);
 		hex_encode(footerData, footerOffset, hexDump);
@@ -301,7 +301,7 @@ CStoreReadFooterFromInternalStorage(Relation relation)
 	postscriptSizeOffset = footerOffset - CSTORE_POSTSCRIPT_SIZE_LENGTH;
 	memcpy(&postscriptSize, footerData + postscriptSizeOffset, CSTORE_POSTSCRIPT_SIZE_LENGTH);
 
-	ereport(WARNING, (errmsg("PS size %d, PS offset %d", (int) postscriptSize, (int) postscriptOffset)));
+//	ereport(WARNING, (errmsg("PS size %d, PS offset %d", (int) postscriptSize, (int) postscriptOffset)));
 
 	if (postscriptSize + CSTORE_POSTSCRIPT_SIZE_LENGTH > fileLength)
 	{
@@ -310,7 +310,7 @@ CStoreReadFooterFromInternalStorage(Relation relation)
 
 	postscriptOffset = postscriptSizeOffset - postscriptSize;
 
-	ereport(WARNING, (errmsg("PS size %d, PS offset %d", (int) postscriptSize, (int) postscriptOffset)));
+//	ereport(WARNING, (errmsg("PS size %d, PS offset %d", (int) postscriptSize, (int) postscriptOffset)));
 
 	postscriptBuffer = makeStringInfo();
 	appendBinaryStringInfo(postscriptBuffer, footerData + postscriptOffset, postscriptSize );
@@ -444,7 +444,7 @@ CStoreEndRead(TableReadState *readState)
 	int columnCount = readState->tupleDescriptor->natts;
 
 	MemoryContextDelete(readState->stripeReadContext);
-	FreeFile(readState->tableFile);
+	//FreeFile(readState->tableFile);
 	list_free_deep(readState->tableFooter->stripeMetadataList);
 	FreeColumnBlockDataArray(readState->blockDataArray, columnCount);
 	pfree(readState->tableFooter);
@@ -1517,7 +1517,7 @@ ReadFromFileInternalStorage(Relation relation, uint64 offset, uint32 size)
 		uint32 bufferSize = VARSIZE(pageContents);
 		uint32 copySize = remainingSize;
 
-		if (bufferSize < 0)
+		if (bufferSize > 0 && false)
 		{
 			memset(hexDump, 0, BLCKSZ*2);
 			hex_encode(pageContents, bufferSize+4, hexDump);
