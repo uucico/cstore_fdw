@@ -41,7 +41,6 @@ static StripeBuffers * CreateEmptyStripeBuffers(uint32 stripeMaxRowCount,
 static StripeSkipList * CreateEmptyStripeSkipList(uint32 stripeMaxRowCount,
 												  uint32 blockRowCount,
 												  uint32 columnCount);
-static StripeMetadata FlushStripe(TableWriteState *writeState);
 static StripeMetadata FlushStripeToInternalStorage(TableWriteState *writeState);
 static StringInfo * CreateSkipListBufferArray(StripeSkipList *stripeSkipList,
 											  TupleDesc tupleDescriptor);
@@ -124,7 +123,6 @@ CStoreBeginWrite(const char *filename, CompressionType compressionType,
 								   filename)));
 		}
 
-		//tableFooter = CStoreReadFooter(tableFooterFilename);
 		tableFooter = CStoreReadFooterFromInternalStorage(relation);
 
 	}
@@ -629,141 +627,6 @@ CreateEmptyStripeSkipList(uint32 stripeMaxRowCount, uint32 blockRowCount,
  * the function creates the skip list and footer buffers. Finally, the function
  * flushes the skip list, data, and footer buffers to the file.
  */
-static StripeMetadata
-FlushStripe(TableWriteState *writeState)
-{
-	StripeMetadata stripeMetadata = {0, 0, 0, 0};
-	uint64 skipListLength = 0;
-	uint64 dataLength = 0;
-	StringInfo *skipListBufferArray = NULL;
-	StripeFooter *stripeFooter = NULL;
-	StringInfo stripeFooterBuffer = NULL;
-	uint32 columnIndex = 0;
-	uint32 blockIndex = 0;
-	TableFooter *tableFooter = writeState->tableFooter;
-	FILE *tableFile = writeState->tableFile;
-	StripeBuffers *stripeBuffers = writeState->stripeBuffers;
-	StripeSkipList *stripeSkipList = writeState->stripeSkipList;
-	ColumnBlockSkipNode **columnSkipNodeArray = stripeSkipList->blockSkipNodeArray;
-	TupleDesc tupleDescriptor = writeState->tupleDescriptor;
-	uint32 columnCount = tupleDescriptor->natts;
-	uint32 blockCount = stripeSkipList->blockCount;
-	uint32 blockRowCount = tableFooter->blockRowCount;
-	uint32 lastBlockIndex = stripeBuffers->rowCount / blockRowCount;
-	uint32 lastBlockRowCount = stripeBuffers->rowCount % blockRowCount;
-
-	/*
-	 * check if the last block needs serialization , the last block was not serialized
-	 * if it was not full yet, e.g.  (rowCount > 0)
-	 */
-	if (lastBlockRowCount > 0)
-	{
-		SerializeBlockData(writeState, lastBlockIndex, lastBlockRowCount);
-	}
-
-	/* update buffer sizes and positions in stripe skip list */
-	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
-	{
-		ColumnBlockSkipNode *blockSkipNodeArray = columnSkipNodeArray[columnIndex];
-		uint64 currentExistsBlockOffset = 0;
-		uint64 currentValueBlockOffset = 0;
-		ColumnBuffers *columnBuffers = stripeBuffers->columnBuffersArray[columnIndex];
-
-		for (blockIndex = 0; blockIndex < blockCount; blockIndex++)
-		{
-			ColumnBlockBuffers *blockBuffers =
-					columnBuffers->blockBuffersArray[blockIndex];
-			uint64 existsBufferSize = blockBuffers->existsBuffer->len;
-			uint64 valueBufferSize = blockBuffers->valueBuffer->len;
-			CompressionType valueCompressionType = blockBuffers->valueCompressionType;
-			ColumnBlockSkipNode *blockSkipNode = &blockSkipNodeArray[blockIndex];
-
-			blockSkipNode->existsBlockOffset = currentExistsBlockOffset;
-			blockSkipNode->existsLength = existsBufferSize;
-			blockSkipNode->valueBlockOffset = currentValueBlockOffset;
-			blockSkipNode->valueLength = valueBufferSize;
-			blockSkipNode->valueCompressionType = valueCompressionType;
-
-			currentExistsBlockOffset += existsBufferSize;
-			currentValueBlockOffset += valueBufferSize;
-		}
-	}
-
-	/* create skip list and footer buffers */
-	skipListBufferArray = CreateSkipListBufferArray(stripeSkipList, tupleDescriptor);
-	stripeFooter = CreateStripeFooter(stripeSkipList, skipListBufferArray);
-	stripeFooterBuffer = SerializeStripeFooter(stripeFooter);
-
-	/*
-	 * Each stripe has three sections:
-	 * (1) Skip list, which contains statistics for each column block, and can
-	 * be used to skip reading row blocks that are refuted by WHERE clause list,
-	 * (2) Data section, in which we store data for each column continuously.
-	 * We store data for each for each column in blocks. For each block, we
-	 * store two buffers: "exists" buffer, and "value" buffer. "exists" buffer
-	 * tells which values are not NULL. "value" buffer contains values for
-	 * present values. For each column, we first store all "exists" buffers,
-	 * and then all "value" buffers.
-	 * (3) Stripe footer, which contains the skip list buffer size, exists buffer
-	 * size, and value buffer size for each of the columns.
-	 *
-	 * We start by flushing the skip list buffers.
-	 */
-	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
-	{
-		StringInfo skipListBuffer = skipListBufferArray[columnIndex];
-		WriteToFile(tableFile, skipListBuffer->data, skipListBuffer->len);
-	}
-
-	/* then, we flush the data buffers */
-	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
-	{
-		ColumnBuffers *columnBuffers = stripeBuffers->columnBuffersArray[columnIndex];
-		uint32 blockIndex = 0;
-
-		for (blockIndex = 0; blockIndex < stripeSkipList->blockCount; blockIndex++)
-		{
-			ColumnBlockBuffers *blockBuffers =
-					columnBuffers->blockBuffersArray[blockIndex];
-			StringInfo existsBuffer = blockBuffers->existsBuffer;
-
-			WriteToFile(tableFile, existsBuffer->data, existsBuffer->len);
-		}
-
-		for (blockIndex = 0; blockIndex < stripeSkipList->blockCount; blockIndex++)
-		{
-			ColumnBlockBuffers *blockBuffers =
-					columnBuffers->blockBuffersArray[blockIndex];
-			StringInfo valueBuffer = blockBuffers->valueBuffer;
-
-			WriteToFile(tableFile, valueBuffer->data, valueBuffer->len);
-		}
-	}
-
-	/* finally, we flush the footer buffer */
-	WriteToFile(tableFile, stripeFooterBuffer->data, stripeFooterBuffer->len);
-
-	/* set stripe metadata */
-	for (columnIndex = 0; columnIndex < columnCount; columnIndex++)
-	{
-		skipListLength += stripeFooter->skipListSizeArray[columnIndex];
-		dataLength += stripeFooter->existsSizeArray[columnIndex];
-		dataLength += stripeFooter->valueSizeArray[columnIndex];
-	}
-
-	stripeMetadata.fileOffset = writeState->currentFileOffset;
-	stripeMetadata.skipListLength = skipListLength;
-	stripeMetadata.dataLength = dataLength;
-	stripeMetadata.footerLength = stripeFooterBuffer->len;
-
-	/* advance current file offset */
-	writeState->currentFileOffset += skipListLength;
-	writeState->currentFileOffset += dataLength;
-	writeState->currentFileOffset += stripeFooterBuffer->len;
-
-	return stripeMetadata;
-}
-
 static StripeMetadata
 FlushStripeToInternalStorage(TableWriteState *writeState)
 {
@@ -1311,10 +1174,8 @@ WriteToInternalStorage(TableWriteState *writeState, void *data, uint32 dataLengt
 		blockOffset = 0;
 
 		pageHeader->pd_lower += copySize;
-		//SET_VARSIZE(pageData, usedSize);
 		if (pageHeader->pd_lower >= pageHeader->pd_upper)
 		{
-//			ereport(WARNING, (errmsg("marking page full")));
 			pageHeader->pd_flags |= PD_PAGE_FULL;
 		}
 

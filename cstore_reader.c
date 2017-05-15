@@ -80,12 +80,9 @@ static void DeserializeBlockData(StripeBuffers *stripeBuffers, uint64 blockIndex
 								 TupleDesc tupleDescriptor);
 static Datum ColumnDefaultValue(TupleConstr *tupleConstraints,
 								Form_pg_attribute attributeForm);
-static int64 FileSize(FILE *file);
-static StringInfo ReadFromFile(FILE *file, uint64 offset, uint32 size);
 static StringInfo ReadFromFileInternalStorage(Relation relation, uint64 offset, uint32 size);
 static void ResetUncompressedBlockData(ColumnBlockData **blockDataArray,
 									   uint32 columnCount);
-static uint64 StripeRowCount(FILE *tableFile, StripeMetadata *stripeMetadata);
 static uint64 StripeRowCountInternalStorage(Relation relation, StripeMetadata *stripeMetadata);
 
 
@@ -150,70 +147,6 @@ CStoreBeginRead(const char *filename, TupleDesc tupleDescriptor,
  * function reads the postscript. Last, the function reads and deserializes the
  * footer.
  */
-TableFooter *
-CStoreReadFooter(StringInfo tableFooterFilename)
-{
-	TableFooter *tableFooter = NULL;
-	FILE *tableFooterFile = NULL;
-	uint64 footerOffset = 0;
-	uint64 footerLength = 0;
-	StringInfo postscriptBuffer = NULL;
-	StringInfo postscriptSizeBuffer = NULL;
-	uint64 postscriptSizeOffset = 0;
-	uint8 postscriptSize = 0;
-	uint64 footerFileSize = 0;
-	uint64 postscriptOffset = 0;
-	StringInfo footerBuffer = NULL;
-	int freeResult = 0;
-
-	tableFooterFile = AllocateFile(tableFooterFilename->data, PG_BINARY_R);
-	if (tableFooterFile == NULL)
-	{
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("could not open file \"%s\" for reading: %m",
-							   tableFooterFilename->data),
-						errhint("Try copying in data to the table.")));
-	}
-
-	footerFileSize = FileSize(tableFooterFile);
-	if (footerFileSize < CSTORE_POSTSCRIPT_SIZE_LENGTH)
-	{
-		ereport(ERROR, (errmsg("invalid cstore file")));
-	}
-
-	postscriptSizeOffset = footerFileSize - CSTORE_POSTSCRIPT_SIZE_LENGTH;
-	postscriptSizeBuffer = ReadFromFile(tableFooterFile, postscriptSizeOffset,
-										CSTORE_POSTSCRIPT_SIZE_LENGTH);
-	memcpy(&postscriptSize, postscriptSizeBuffer->data, CSTORE_POSTSCRIPT_SIZE_LENGTH);
-	if (postscriptSize + CSTORE_POSTSCRIPT_SIZE_LENGTH > footerFileSize)
-	{
-		ereport(ERROR, (errmsg("invalid postscript size")));
-	}
-
-	postscriptOffset = footerFileSize - (CSTORE_POSTSCRIPT_SIZE_LENGTH + postscriptSize);
-	postscriptBuffer = ReadFromFile(tableFooterFile, postscriptOffset, postscriptSize);
-
-	DeserializePostScript(postscriptBuffer, &footerLength);
-	if (footerLength + postscriptSize + CSTORE_POSTSCRIPT_SIZE_LENGTH > footerFileSize)
-	{
-		ereport(ERROR, (errmsg("invalid footer size")));
-	}
-
-	footerOffset = postscriptOffset - footerLength;
-	footerBuffer = ReadFromFile(tableFooterFile, footerOffset, footerLength);
-	tableFooter = DeserializeTableFooter(footerBuffer);
-
-	freeResult = FreeFile(tableFooterFile);
-	if (freeResult != 0)
-	{
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("could not close file: %m")));
-	}
-
-	return tableFooter;
-}
-
-
 TableFooter *
 CStoreReadFooterFromInternalStorage(Relation relation)
 {
@@ -514,44 +447,6 @@ FreeColumnBlockDataArray(ColumnBlockData **blockDataArray, uint32 columnCount)
 
 /* CStoreTableRowCount returns the exact row count of a table using skiplists */
 uint64
-CStoreTableRowCount(const char *filename, Relation relation)
-{
-	TableFooter *tableFooter = NULL;
-	FILE *tableFile;
-	ListCell *stripeMetadataCell = NULL;
-	uint64 totalRowCount = 0;
-
-	StringInfo tableFooterFilename = makeStringInfo();
-
-	appendStringInfo(tableFooterFilename, "%s%s", filename, CSTORE_FOOTER_FILE_SUFFIX);
-
-	//tableFooter = CStoreReadFooter(tableFooterFilename);
-	tableFooter = CStoreReadFooterFromInternalStorage(relation);
-
-
-	pfree(tableFooterFilename->data);
-	pfree(tableFooterFilename);
-
-	tableFile = AllocateFile(filename, PG_BINARY_R);
-	if (tableFile == NULL)
-	{
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("could not open file \"%s\" for reading: %m", filename)));
-	}
-
-	foreach(stripeMetadataCell, tableFooter->stripeMetadataList)
-	{
-		StripeMetadata *stripeMetadata = (StripeMetadata *) lfirst(stripeMetadataCell);
-		totalRowCount += StripeRowCount(tableFile, stripeMetadata);
-	}
-
-	FreeFile(tableFile);
-
-	return totalRowCount;
-}
-
-
-uint64
 CStoreTableRowCountInternalStorage(Relation relation)
 {
 	TableFooter *tableFooter = NULL;
@@ -574,30 +469,6 @@ CStoreTableRowCountInternalStorage(Relation relation)
  * StripeRowCount reads serialized stripe footer, the first column's
  * skip list, and returns number of rows for given stripe.
  */
-static uint64
-StripeRowCount(FILE *tableFile, StripeMetadata *stripeMetadata)
-{
-	uint64 rowCount = 0;
-	StripeFooter *stripeFooter = NULL;
-	StringInfo footerBuffer = NULL;
-	StringInfo firstColumnSkipListBuffer = NULL;
-	uint64 footerOffset = 0;
-
-	footerOffset += stripeMetadata->fileOffset;
-	footerOffset += stripeMetadata->skipListLength;
-	footerOffset += stripeMetadata->dataLength;
-
-	footerBuffer = ReadFromFile(tableFile, footerOffset, stripeMetadata->footerLength);
-	stripeFooter = DeserializeStripeFooter(footerBuffer);
-
-	firstColumnSkipListBuffer = ReadFromFile(tableFile, stripeMetadata->fileOffset,
-	                                         stripeFooter->skipListSizeArray[0]);
-	rowCount =  DeserializeRowCount(firstColumnSkipListBuffer);
-
-	return rowCount;
-}
-
-
 static uint64
 StripeRowCountInternalStorage(Relation relation, StripeMetadata *stripeMetadata)
 {
@@ -1414,74 +1285,10 @@ ColumnDefaultValue(TupleConstr *tupleConstraints, Form_pg_attribute attributeFor
 }
 
 
-/* Returns the size of the given file handle. */
-static int64
-FileSize(FILE *file)
-{
-	int64 fileSize = 0;
-	int fseekResult = 0;
 
-	errno = 0;
-	fseekResult = fseeko(file, 0, SEEK_END);
-	if (fseekResult != 0)
-	{
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("could not seek in file: %m")));
-	}
-
-	fileSize = ftello(file);
-	if (fileSize == -1)
-	{
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("could not get position in file: %m")));
-	}
-
-	return fileSize;
-}
 
 
 /* Reads the given segment from the given file. */
-static StringInfo
-ReadFromFile(FILE *file, uint64 offset, uint32 size)
-{
-	int fseekResult = 0;
-	int freadResult = 0;
-	int fileError = 0;
-
-	StringInfo resultBuffer = makeStringInfo();
-	enlargeStringInfo(resultBuffer, size);
-	resultBuffer->len = size;
-
-	if (size == 0)
-	{
-		return resultBuffer;
-	}
-
-	errno = 0;
-	fseekResult = fseeko(file, offset, SEEK_SET);
-	if (fseekResult != 0)
-	{
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("could not seek in file: %m")));
-	}
-
-	freadResult = fread(resultBuffer->data, size, 1, file);
-	if (freadResult != 1)
-	{
-		ereport(ERROR, (errmsg("could not read enough data from file")));
-	}
-
-	fileError = ferror(file);
-	if (fileError != 0)
-	{
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("could not read file: %m")));
-	}
-
-	return resultBuffer;
-}
-
-
 static StringInfo
 ReadFromFileInternalStorage(Relation relation, uint64 offset, uint32 size)
 {
