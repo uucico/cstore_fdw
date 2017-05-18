@@ -24,7 +24,6 @@
 
 
 /* Defines for valid option names */
-#define OPTION_NAME_FILENAME "filename"
 #define OPTION_NAME_COMPRESSION_TYPE "compression"
 #define OPTION_NAME_STRIPE_ROW_COUNT "stripe_row_count"
 #define OPTION_NAME_BLOCK_ROW_COUNT "block_row_count"
@@ -69,6 +68,9 @@
 
 #define FOOTER_FORKNUM MAIN_FORKNUM
 #define DATA_FORKNUM FSM_FORKNUM
+
+#define CSTORE_PAGE_DATA_SIZE (BLCKSZ - SizeOfPageHeaderData)
+
 /*
  * CStoreValidOption keeps an option name and a context. When an option is passed
  * into cstore_fdw objects (server and foreign table), we compare this option's
@@ -87,7 +89,6 @@ static const uint32 ValidOptionCount = 4;
 static const CStoreValidOption ValidOptionArray[] =
 {
 	/* foreign table options */
-	{ OPTION_NAME_FILENAME, ForeignTableRelationId },
 	{ OPTION_NAME_COMPRESSION_TYPE, ForeignTableRelationId },
 	{ OPTION_NAME_STRIPE_ROW_COUNT, ForeignTableRelationId },
 	{ OPTION_NAME_BLOCK_ROW_COUNT, ForeignTableRelationId }
@@ -113,7 +114,6 @@ typedef enum
  */
 typedef struct CStoreFdwOptions
 {
-	char *filename;
 	CompressionType compressionType;
 	uint64 stripeRowCount;
 	uint32 blockRowCount;
@@ -255,7 +255,6 @@ typedef struct StripeFooter
 /* TableReadState represents state of a cstore file read operation. */
 typedef struct TableReadState
 {
-	FILE *tableFile;
 	TableFooter *tableFooter;
 	TupleDesc tupleDescriptor;
 
@@ -281,15 +280,12 @@ typedef struct TableReadState
 /* TableWriteState represents state of a cstore file write operation. */
 typedef struct TableWriteState
 {
-	FILE *tableFile;
 	TableFooter *tableFooter;
-	StringInfo tableFooterFilename;
 	CompressionType compressionType;
 	TupleDesc tupleDescriptor;
 	FmgrInfo **comparisonFunctionArray;
 	uint64 currentFileOffset;
 	Relation relation;
-	void *relfileNode;
 	int32 blockNumber;
 	int32 blockOffset;
 
@@ -323,8 +319,7 @@ extern Datum cstore_fdw_handler(PG_FUNCTION_ARGS);
 extern Datum cstore_fdw_validator(PG_FUNCTION_ARGS);
 
 /* Function declarations for writing to a cstore file */
-extern TableWriteState * CStoreBeginWrite(const char *filename,
-										  CompressionType compressionType,
+extern TableWriteState * CStoreBeginWrite(CompressionType compressionType,
 										  uint64 stripeMaxRowCount,
 										  uint32 blockRowCount,
 										  TupleDesc tupleDescriptor,
@@ -334,7 +329,7 @@ extern void CStoreWriteRow(TableWriteState *state, Datum *columnValues,
 extern void CStoreEndWrite(TableWriteState * state);
 
 /* Function declarations for reading from a cstore file */
-extern TableReadState * CStoreBeginRead(const char *filename, TupleDesc tupleDescriptor,
+extern TableReadState * CStoreBeginRead(TupleDesc tupleDescriptor,
 										List *projectedColumnList, List *qualConditions, Relation relation);
 extern TableFooter * CStoreReadFooterFromInternalStorage(Relation relation);
 extern bool CStoreReadFinished(TableReadState *state);

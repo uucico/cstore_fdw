@@ -1,50 +1,47 @@
 --
 -- Test the CREATE statements related to cstore_fdw.
 --
+
+
 -- Install cstore_fdw
 CREATE EXTENSION cstore_fdw;
+
 CREATE SERVER cstore_server FOREIGN DATA WRAPPER cstore_fdw;
+
+
 -- Validator tests
 CREATE FOREIGN TABLE test_validator_invalid_option () 
 	SERVER cstore_server 
-	OPTIONS(filename 'data.cstore', bad_option_name '1'); -- ERROR
-ERROR:  invalid option "bad_option_name"
-HINT:  Valid options in this context are: filename, compression, stripe_row_count, block_row_count
+	OPTIONS(bad_option_name '1'); -- ERROR
+
 CREATE FOREIGN TABLE test_validator_invalid_stripe_row_count () 
 	SERVER cstore_server
-	OPTIONS(filename 'data.cstore', stripe_row_count '0'); -- ERROR
-ERROR:  invalid stripe row count
-HINT:  Stripe row count must be an integer between 1000 and 10000000
+	OPTIONS(stripe_row_count '0'); -- ERROR
+
 CREATE FOREIGN TABLE test_validator_invalid_block_row_count () 
 	SERVER cstore_server
-	OPTIONS(filename 'data.cstore', block_row_count '0'); -- ERROR
-ERROR:  invalid block row count
-HINT:  Block row count must be an integer between 1000 and 100000
+	OPTIONS(block_row_count '0'); -- ERROR
+
 CREATE FOREIGN TABLE test_validator_invalid_compression_type () 
 	SERVER cstore_server
 	OPTIONS(filename 'data.cstore', compression 'invalid_compression'); -- ERROR
-ERROR:  invalid compression type
-HINT:  Valid options are: none, pglz
--- Invalid file path test
+
+-- filename option is not supported anymore
 CREATE FOREIGN TABLE test_invalid_file_path ()
 	SERVER cstore_server
-	OPTIONS(filename 'bad_directory_path/bad_file_path'); --ERROR
-ERROR:  could not open file "bad_directory_path/bad_file_path" for writing: No such file or directory
+	OPTIONS(filename 'data.cstore'); --ERROR
+
 -- Create uncompressed table
 CREATE FOREIGN TABLE contestant (handle TEXT, birthdate DATE, rating INT,
 	percentile FLOAT, country CHAR(3), achievements TEXT[])
-	SERVER cstore_server
-	OPTIONS(filename '@abs_srcdir@/data/contestant.cstore');
+	SERVER cstore_server;
+
 -- Create compressed table with automatically determined file path
 CREATE FOREIGN TABLE contestant_compressed (handle TEXT, birthdate DATE, rating INT,
 	percentile FLOAT, country CHAR(3), achievements TEXT[])
 	SERVER cstore_server
 	OPTIONS(compression 'pglz');
+
 -- Test that querying an empty table works
 ANALYZE contestant;
 SELECT count(*) FROM contestant;
- count 
--------
-     0
-(1 row)
-

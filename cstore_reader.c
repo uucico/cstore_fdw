@@ -91,18 +91,15 @@ static uint64 StripeRowCountInternalStorage(Relation relation, StripeMetadata *s
  * read handle that's used during reading rows and finishing the read operation.
  */
 TableReadState *
-CStoreBeginRead(const char *filename, TupleDesc tupleDescriptor,
+CStoreBeginRead(TupleDesc tupleDescriptor,
 				List *projectedColumnList, List *whereClauseList, Relation relation)
 {
 	TableReadState *readState = NULL;
 	TableFooter *tableFooter = NULL;
-	FILE *tableFile = NULL;
 	MemoryContext stripeReadContext = NULL;
 	uint32 columnCount = 0;
 	bool *projectedColumnMask = NULL;
 	ColumnBlockData **blockDataArray  = NULL;
-	StringInfo tableFooterFilename = makeStringInfo();
-	appendStringInfo(tableFooterFilename, "%s%s", filename, CSTORE_FOOTER_FILE_SUFFIX);
 
 	tableFooter = CStoreReadFooterFromInternalStorage(relation);
 
@@ -124,7 +121,6 @@ CStoreBeginRead(const char *filename, TupleDesc tupleDescriptor,
 										 	   tableFooter->blockRowCount);
 
 	readState = palloc0(sizeof(TableReadState));
-	readState->tableFile = tableFile;
 	readState->tableFooter = tableFooter;
 	readState->projectedColumnList = projectedColumnList;
 	readState->whereClauseList = whereClauseList;
@@ -172,6 +168,11 @@ CStoreReadFooterFromInternalStorage(Relation relation)
 
 
 	blockCount = RelationGetNumberOfBlocksInFork(relation, FOOTER_FORKNUM);
+
+	if (blockCount == 0)
+	{
+		return NULL;
+	}
 
 //	ereport(WARNING, (errmsg("Found %d blocks in main fork", (int) blockCount)));
 
