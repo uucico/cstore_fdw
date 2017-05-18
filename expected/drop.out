@@ -9,7 +9,7 @@ SELECT count(*) FROM (
 	) AS q1) AS q2;
  count 
 -------
-     2
+     0
 (1 row)
 
 -- DROP cstore_fdw tables
